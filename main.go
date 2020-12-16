@@ -2,347 +2,194 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
-	"golang.org/x/crypto/ssh"
+	"crypto/rand"
+	"crypto/rsa"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"sync"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
+	"golang.org/x/crypto/ssh"
 )
 
 func main() {
+	// Open listen socket
 	listener, err := net.Listen("tcp", "0.0.0.0:2222")
 	if err != nil {
-		log.Fatalf("Failed to listen on 0.0.0.0:2222 (%s)", err)
+		log.Fatalln(err)
 	}
-	log.Printf("Listening on 0.0.0.0:2222")
-
-	sshConfig := &ssh.ServerConfig{}
-	// region SSH authentication
-	sshConfig.PasswordCallback = func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-		if conn.User() == "foo" && string(password) == "bar" {
-			return &ssh.Permissions{}, nil
-		} else {
-			return nil, fmt.Errorf("authentication failed")
-		}
-	}
-	// endregion
-
-	// region Host key
-	hostKeyData, err := ioutil.ReadFile("ssh_host_rsa_key")
-	if err != nil {
-		log.Fatalf("failed to load host key (%s)", err)
-	}
-	signer, err := ssh.ParsePrivateKey(hostKeyData)
-	if err != nil {
-		log.Fatalf("failed to parse host key (%s)", err)
-	}
-	sshConfig.AddHostKey(signer)
-	// endregion
-
 	for {
-		tcpConn, err := listener.Accept()
+		// Accept TCP connection
+		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Failed to accept incoming connection (%s)", err)
-			// Continue with the next loop
-			continue
-		}
-
-		sshConn, chans, reqs, err := ssh.NewServerConn(tcpConn, sshConfig)
-		if err != nil {
-			log.Printf("handshake failed (%s)", err)
-			continue
-		}
-
-		go ssh.DiscardRequests(reqs)
-		go handleChannels(sshConn, chans)
-	}
-}
-
-func handleChannels(conn *ssh.ServerConn, chans <-chan ssh.NewChannel) {
-	for newChannel := range chans {
-		go handleChannel(conn, newChannel)
-	}
-}
-
-type channelProperties struct {
-	// Allocate pseudo-terminal for interactive sessions.
-	pty bool
-	// Store the container ID once it is started.
-	containerId string
-	// Environment variables passed from the SSH session.
-	env map[string]string
-	// Horizontal screen size
-	cols uint
-	// Vertical screen size
-	rows uint
-	// Context required by the Docker client.
-	ctx context.Context
-	// Docker client
-	docker *client.Client
-}
-
-func handleChannel(conn *ssh.ServerConn, newChannel ssh.NewChannel) {
-	if t := newChannel.ChannelType(); t != "session" {
-		_ = newChannel.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel type: %s", t))
-		return
-	}
-
-	docker, err := client.NewClient("tcp://127.0.0.1:2375", "", nil, make(map[string]string))
-	if err != nil {
-		_ = newChannel.Reject(ssh.ConnectionFailed, fmt.Sprintf("error contacting backend (%s)", err))
-		return
-	}
-
-	channelProps := &channelProperties{
-		pty:         false,
-		containerId: "",
-		env:         map[string]string{},
-		cols:        80,
-		rows:        25,
-		ctx:         context.Background(),
-		docker:      docker,
-	}
-
-	channel, requests, err := newChannel.Accept()
-	if err != nil {
-		log.Printf("could not accept channel (%s)", err)
-		err := docker.Close()
-		if err != nil {
-			log.Printf("eror while closing Docker connection (%s)", err)
-		}
-		return
-	}
-
-	//...
-	removeContainer := func() {
-		if channelProps.containerId != "" {
-			//Remove container
-			removeOptions := types.ContainerRemoveOptions{Force: true}
-			err := docker.ContainerRemove(channelProps.ctx, channelProps.containerId, removeOptions)
-			if err != nil {
-				log.Printf("error while removing container (%s)", err)
-			}
-			channelProps.containerId = ""
-		}
-	}
-	closeConnections := func() {
-		removeContainer()
-		//Close Docker connection
-		err = docker.Close()
-		if err != nil {
-			log.Printf("error while closing Docker connection (%s)", err)
-		}
-		//Close SSH connection
-		err := conn.Close()
-		if err != nil {
-			log.Printf("error while closing SSH channel (%s)", err)
-		}
-	}
-
-	go func() {
-		for req := range requests {
-			reply := func(success bool, message []byte) {
-				if req.WantReply {
-					err := req.Reply(success, message)
-					if err != nil {
-						closeConnections()
-					}
-				}
-			}
-			handleRequest(
-				channel,
-				req,
-				reply,
-				closeConnections,
-				removeContainer,
-				channelProps,
-			)
-		}
-	}()
-}
-
-type envRequestMsg struct {
-	Name  string
-	Value string
-}
-
-type windowChangeRequestMsg struct {
-	Columns uint32
-	Rows    uint32
-	Width   uint32
-	Height  uint32
-}
-
-func handleRequest(
-	channel ssh.Channel,
-	req *ssh.Request,
-	reply func(success bool, message []byte),
-	closeConnections func(),
-	removeContainer func(),
-	channelProps *channelProperties,
-) {
-	switch req.Type {
-	case "env":
-		if channelProps.containerId != "" {
-			reply(false, []byte(fmt.Sprintf("cannot set env variables after shell or program already started")))
-			return
-		}
-		request := envRequestMsg{}
-		err := ssh.Unmarshal(req.Payload, request)
-		if err != nil {
-			reply(false, []byte(fmt.Sprintf("invalid payload (%s)", err)))
-		}
-		channelProps.env[request.Name] = request.Value
-	case "pty-req":
-		if channelProps.containerId != "" {
-			reply(false, []byte(fmt.Sprintf("cannot set pty after shell or program already started")))
-			return
-		}
-		channelProps.pty = true
-	case "window-change":
-		request := windowChangeRequestMsg{}
-		err := ssh.Unmarshal(req.Payload, request)
-		if err != nil {
-			reply(false, []byte(fmt.Sprintf("invalid payload (%s)", err)))
-			return
-		}
-		channelProps.cols = uint(request.Columns)
-		channelProps.rows = uint(request.Rows)
-		if channelProps.containerId != "" {
-			err = channelProps.docker.ContainerResize(
-				channelProps.ctx,
-				channelProps.containerId,
-				types.ResizeOptions{
-					Height: channelProps.rows,
-					Width:  channelProps.cols,
-				},
-			)
-			if err != nil {
-				reply(false, []byte(fmt.Sprintf("failed to set window size (%s)", err)))
-				return
-			}
-		}
-	case "shell":
-		if channelProps.containerId != "" {
-			reply(false, []byte(fmt.Sprintf("cannot launch a second shell")))
 			break
 		}
 
-		//Pull the container image
-		pullReader, err := channelProps.docker.ImagePull(channelProps.ctx, "docker.io/library/busybox", types.ImagePullOptions{})
-		if err != nil {
-			reply(false, []byte(fmt.Sprintf("could not pull busybox image (%s)", err)))
-			return
-		}
-		_, err = ioutil.ReadAll(pullReader)
-		if err != nil {
-			reply(false, []byte(fmt.Sprintf("could not pull busybox image (%s)", err)))
-			return
-		}
-		err = pullReader.Close()
-		if err != nil {
-			reply(false, []byte(fmt.Sprintf("could not pull busybox image (%s)", err)))
-			return
-		}
+		config := getServerConfig(err)
 
-		//Create the container
-		var env []string
-		for key, value := range channelProps.env {
-			env = append(env, fmt.Sprintf("%s=%s", key, value))
-		}
-		body, err := channelProps.docker.ContainerCreate(
-			channelProps.ctx,
-			&container.Config{
-				Image:        "busybox",
-				AttachStdout: true,
-				AttachStderr: true,
-				AttachStdin:  true,
-				Tty:          channelProps.pty,
-				StdinOnce:    true,
-				OpenStdin:    true,
-				Env:          env,
-			},
-			&container.HostConfig{},
-			&network.NetworkingConfig{},
-			"",
-		)
+		// Perform SSH handshake
+		_, newChannels, requests, err := ssh.NewServerConn(conn, config)
 		if err != nil {
-			reply(false, []byte(fmt.Sprintf("failed to create container (%s)", err)))
-			return
+			_ = conn.Close()
+			continue
 		}
-		channelProps.containerId = body.ID
+		// Handle non-channel requests
+		go handleRequests(requests)
+		// Handle new channels
+		go handleChannels(newChannels)
+	}
+}
 
-		//Attach the container
-		attachResult, err := channelProps.docker.ContainerAttach(
-			channelProps.ctx,
-			channelProps.containerId,
-			types.ContainerAttachOptions{
-				Logs:   true,
-				Stdin:  true,
-				Stderr: true,
-				Stdout: true,
-				Stream: true,
-			},
-		)
-		if err != nil {
-			removeContainer()
-			reply(false, []byte(fmt.Sprintf("failed to attach container (%s)", err)))
-			return
-		}
+func getServerConfig(err error) *ssh.ServerConfig {
+	config := &ssh.ServerConfig{
+		NoClientAuth: true,
+	}
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	hostKey, err := ssh.NewSignerFromKey(key)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	config.AddHostKey(hostKey)
+	return config
+}
 
-		//Start the container
-		err = channelProps.docker.ContainerStart(
-			channelProps.ctx,
-			channelProps.containerId,
-			types.ContainerStartOptions{},
-		)
-		if err != nil {
-			removeContainer()
-			reply(false, []byte(fmt.Sprintf("failed to launch container (%s)", err)))
-			return
+func handleChannels(channels <-chan ssh.NewChannel) {
+	for {
+		// When a new channel comes in, handle it
+		newChannel, ok := <-channels
+		if !ok {
+			// Connection is closed
+			break
 		}
+		go handleChannel(newChannel)
+	}
+}
 
-		//Resize container from any previous `window-change` requests
-		err = channelProps.docker.ContainerResize(
-			channelProps.ctx,
-			channelProps.containerId,
-			types.ResizeOptions{
-				Height: channelProps.rows,
-				Width:  channelProps.cols,
-			},
-		)
-		if err != nil {
-			removeContainer()
-			reply(false, []byte(fmt.Sprintf("failed to resize container (%s)", err)))
-			return
-		}
+func handleChannel(newChannel ssh.NewChannel) {
+	// Accept all channels. Normally, we would check if it s a "session "channel
+	channel, requests, err := newChannel.Accept()
+	if err != nil {
+		log.Println(err)
+		return
+	}
 
-		//Start transferring data
-		var once sync.Once
-		if channelProps.pty {
-			go func() {
-				_, _ = io.Copy(channel, attachResult.Reader)
-				once.Do(closeConnections)
-			}()
-		} else {
-			go func() {
-				//Demultiplex Docker stream into stdout/stderr
-				_, _ = stdcopy.StdCopy(channel, channel.Stderr(), attachResult.Reader)
-				once.Do(closeConnections)
-			}()
+	tty := false
+	for {
+		req, ok := <-requests
+		if !ok {
+			break
 		}
+		switch req.Type {
+		case "pty-req":
+			// Interactive session
+			tty = true
+			if req.WantReply {
+				_ = req.Reply(true, []byte{})
+			}
+		case "shell":
+			if req.WantReply {
+				_ = req.Reply(true, []byte{})
+			}
+			go launchShell(channel, tty)
+		default:
+			if req.WantReply {
+				_ = req.Reply(false, []byte("unsupported request"))
+			}
+		}
+	}
+}
+
+func launchShell(channel ssh.Channel, tty bool) {
+	cli, err := client.NewClientWithOpts()
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	// region Create container
+	cnt, err := cli.ContainerCreate(
+		context.TODO(),
+		&container.Config{
+			Image:       "ubuntu",
+			Tty:         tty,
+			AttachStdin: true,
+			StdinOnce:   true,
+			OpenStdin:   true,
+		},
+		nil,
+		nil,
+		nil,
+		"",
+	)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	// endregion
+
+	// region Attach to container
+	attach, err := cli.ContainerAttach(
+		context.Background(),
+		cnt.ID,
+		types.ContainerAttachOptions{
+			Stream: true,
+			Stdin:  true,
+			Stdout: true,
+			Stderr: true,
+			Logs:   true,
+		},
+	)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	// endregion
+
+	// region Start container
+	err = cli.ContainerStart(context.TODO(), cnt.ID, types.ContainerStartOptions{})
+	if err != nil {
+		log.Fatalln(err)
+	}
+	// endregion
+
+	closeChannel := func() {
+		_ = channel.Close()
+		_ = cli.ContainerRemove(context.TODO(), cnt.ID, types.ContainerRemoveOptions{})
+	}
+
+	var once sync.Once
+	if tty {
 		go func() {
-			_, _ = io.Copy(attachResult.Conn, channel)
-			once.Do(closeConnections)
+			// Copy container output only to stdout (TTY is already multiplexed)
+			_, _ = io.Copy(channel, attach.Reader)
+			once.Do(closeChannel)
 		}()
-	default:
-		reply(false, []byte(fmt.Sprintf("unsupported request type (%s)", req.Type)))
+	} else {
+		go func() {
+			// Copy from to stdout and stderr
+			_, _ = stdcopy.StdCopy(channel, channel.Stderr(), attach.Reader)
+			once.Do(closeChannel)
+		}()
+	}
+	go func() {
+		// Copy stdin from channel to container
+		_, _ = io.Copy(attach.Conn, channel)
+		once.Do(closeChannel)
+	}()
+}
+
+func handleRequests(requests <-chan *ssh.Request) {
+	for {
+		request, ok := <-requests
+		if !ok {
+			break
+		}
+		if request.WantReply {
+			_ = request.Reply(false, []byte("request type not supported"))
+		}
 	}
 }
